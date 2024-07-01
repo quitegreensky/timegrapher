@@ -1,10 +1,8 @@
+import os
 import pyaudio
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import butter, lfilter, find_peaks
-import os
-
-os.system("cls")
 
 # Adjustable Parameters
 FORMAT = pyaudio.paInt16
@@ -13,11 +11,20 @@ RATE = 44100
 CHUNK = 1024
 RECORD_SECONDS = 10
 LOWCUT = 9109  # Lower bound of the frequency range in Hz
-HIGHCUT = 14452 # Upper bound of the frequency range in Hz
+HIGHCUT = 14452  # Upper bound of the frequency range in Hz
 GAIN = 20  # Gain for amplification
 INITIAL_PEAK_THRESHOLD = 0.15  # Initial threshold for peak detection
 TRIM_THRESHOLD = 0.01  # Threshold for trimming audio
-BPH = 21600 # Beat per hour
+COMMON_BPH_VALUES = [18000, 19800, 21600, 25200, 28800, 36000]  # Common BPH values in watches
+
+def clear_terminal():
+    """
+    Clears the terminal screen for Windows, macOS, and Linux.
+    """
+    if os.name == 'nt':  # For Windows
+        os.system('cls')
+    else:  # For macOS and Linux
+        os.system('clear')
 
 # List available input devices
 def list_input_devices():
@@ -39,7 +46,7 @@ def record_audio(device_index, record_seconds=RECORD_SECONDS, rate=RATE, chunk=C
                         input_device_index=device_index,
                         frames_per_buffer=chunk)
 
-    print("Recording...")
+    print(f"Recording for {RECORD_SECONDS} seconds...")
     frames = []
     for _ in range(0, int(rate / chunk * record_seconds)):
         data = stream.read(chunk)
@@ -102,10 +109,24 @@ def analyze_ticks(peaks, rate):
 
     return intervals, beat_errors, average_beat_error, tick_frequency, amplitudes, amplitude_variance
 
+# Estimate Beats Per Hour (BPH)
+def estimate_bph(intervals):
+    average_interval = np.mean(intervals)  # in seconds
+    estimated_bph = (1 / average_interval) * 3600  # Convert to beats per hour
+    return estimated_bph
+
+# Find the closest standard BPH value
+def closest_standard_bph(estimated_bph, common_bph_values=COMMON_BPH_VALUES):
+    closest_bph = min(common_bph_values, key=lambda x: abs(x - estimated_bph))
+    return closest_bph
+
 # Main script
 if __name__ == "__main__":
+    clear_terminal()
     list_input_devices()
     device_index = int(input("Enter the index of the device you want to use: "))
+    clear_terminal()
+
     audio_data = record_audio(device_index)
 
     # Normalize audio data
@@ -122,12 +143,40 @@ if __name__ == "__main__":
 
     # Define threshold for peak detection
     peak_threshold = INITIAL_PEAK_THRESHOLD
-    print("Initial peak detection threshold:", peak_threshold)
 
     # Detect peaks in the trimmed audio signal
     peaks, properties = find_peaks(trimmed_audio, height=peak_threshold, distance=RATE/10)
 
-    # Interactive loop to adjust threshold
+    # Estimate BPH
+    intervals = np.diff(peaks) / RATE
+    estimated_bph = estimate_bph(intervals)
+    closest_bph = closest_standard_bph(estimated_bph)
+
+    # Ask user if they want to use the estimated BPH or manually enter BPH
+    use_auto_bph = input(f"Estimated BPH is {closest_bph}. Do you want to use this value? (y/n): ").strip().lower()
+
+    if use_auto_bph == 'y':
+        BPH = closest_bph
+    else:
+        BPH = int(input("Enter the BPH value manually: "))
+
+    # Analyze ticks
+    intervals, beat_errors, average_beat_error, tick_frequency, amplitudes, amplitude_variance = analyze_ticks(peaks, RATE)
+
+    # Calculate expected interval
+    expected_interval = 1 / (BPH / 3600)  # Convert BPH to beats per second
+
+    # Calculate accuracy
+    accuracy = (intervals - expected_interval) * 1000  # Convert to milliseconds
+
+    # Output analysis results
+    print("=======================")
+    print("Average beat error (s):", average_beat_error)
+    print("Tick frequency (Hz):", tick_frequency)
+    print("Amplitude variance:", amplitude_variance)
+    print("Average accuracy (ms):", np.mean(accuracy))
+    print("=======================")
+
     # Plot the audio signal and detected peaks
     plt.figure(figsize=(12, 6))
     plt.plot(trimmed_audio, label='Filtered and Trimmed Audio Signal')
@@ -137,24 +186,6 @@ if __name__ == "__main__":
     plt.xlabel("Sample Number")
     plt.ylabel("Amplitude")
     plt.show()
-
-    # Analyze ticks
-    intervals, beat_errors, average_beat_error, tick_frequency, amplitudes, amplitude_variance = analyze_ticks(peaks, RATE)
-
-    # Calculate expected interval
-    expected_interval = 1 / (BPH / 3600)  # Assuming a 6 beat per second watch (21600 beats per hour)
-
-    # Calculate accuracy
-    accuracy = (intervals - expected_interval) * 1000  # Convert to milliseconds
-
-    # Output analysis results
-    # print("Intervals between ticks (s):", intervals)
-    print("Average beat error (s):", average_beat_error)
-    print("Tick frequency (Hz):", tick_frequency)
-    # print("Amplitudes of ticks:", amplitudes)
-    print("Amplitude variance:", amplitude_variance)
-    # print("Accuracy (ms):", accuracy)
-    print("Average accuracy (ms):", np.mean(accuracy))
 
     # Plot accuracy
     plt.figure(figsize=(12, 6))
