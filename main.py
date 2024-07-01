@@ -9,7 +9,7 @@ FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
-RECORD_SECONDS = 10
+RECORD_SECONDS = 20
 LOWCUT = 9109  # Lower bound of the frequency range in Hz
 HIGHCUT = 14452  # Upper bound of the frequency range in Hz
 GAIN = 20  # Gain for amplification
@@ -168,13 +168,15 @@ if __name__ == "__main__":
 
     # Calculate accuracy
     accuracy = (intervals - expected_interval) * 1000  # Convert to milliseconds
+    daily_accuracy_seconds = ( ( np.sum(accuracy) / len(accuracy) ) / 1000 ) * 24 * 3600
 
     # Output analysis results
     print("=======================")
     print("Average beat error (s):", average_beat_error)
     print("Tick frequency (Hz):", tick_frequency)
     print("Amplitude variance:", amplitude_variance)
-    print("Average accuracy (ms):", np.mean(accuracy))
+    print("Average tick accuracy (ms):", np.mean(accuracy))
+    print("Daily accuracy (s): ",daily_accuracy_seconds)
     print("=======================")
 
     # Plot the audio signal and detected peaks
