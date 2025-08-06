@@ -3,19 +3,29 @@ import pyaudio
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import butter, lfilter, find_peaks
+import time
+import threading
+from collections import deque
 
 # Adjustable Parameters
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
-RECORD_SECONDS = 10
+RECORD_WINDOW_SECONDS = 10  # 10 seconds for analysis window
+UPDATE_INTERVAL_SECONDS = 1  # Update display every 1 second
 LOWCUT = 9000  # Lower bound of the frequency range in Hz
 HIGHCUT = 15000  # Upper bound of the frequency range in Hz
 GAIN = 30  # Gain for amplification
-INITIAL_PEAK_THRESHOLD = 0.15  # Initial threshold for peak detection
+INITIAL_PEAK_THRESHOLD = 3.5  # Initial threshold for peak detection
 TRIM_THRESHOLD = 0.01  # Threshold for trimming audio
 COMMON_BPH_VALUES = [18000, 19800, 21600, 25200, 28800, 36000]  # Common BPH values in watches
+
+# Global variables for continuous monitoring
+running = False
+accuracy_history = deque(maxlen=100)  # Store last 100 accuracy measurements
+current_bph = None
+audio_buffer = deque(maxlen=int(RATE * RECORD_WINDOW_SECONDS / CHUNK))  # Buffer for 10 seconds of audio
 
 def clear_terminal():
     """
@@ -36,8 +46,8 @@ def list_input_devices():
             print(f"{i}- {device_info['name']}")
     audio.terminate()
 
-# Record audio
-def record_audio(device_index, record_seconds=RECORD_SECONDS, rate=RATE, chunk=CHUNK):
+# Record audio continuously and maintain buffer
+def record_audio_continuous(device_index, rate=RATE, chunk=CHUNK):
     audio = pyaudio.PyAudio()
     stream = audio.open(format=FORMAT,
                         channels=CHANNELS,
@@ -46,18 +56,23 @@ def record_audio(device_index, record_seconds=RECORD_SECONDS, rate=RATE, chunk=C
                         input_device_index=device_index,
                         frames_per_buffer=chunk)
 
-    print(f"Recording for {RECORD_SECONDS} seconds...")
-    frames = []
-    for _ in range(0, int(rate / chunk * record_seconds)):
-        data = stream.read(chunk)
-        frames.append(np.frombuffer(data, dtype=np.int16))
+    try:
+        while running:
+            data = stream.read(chunk)
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            audio_buffer.append(audio_data)
+    except Exception as e:
+        print(f"Error in continuous recording: {e}")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
 
-    print("Finished recording.")
-    stream.stop_stream()
-    stream.close()
-    audio.terminate()
-
-    return np.hstack(frames)
+# Get the current audio buffer as a single array
+def get_current_audio_buffer():
+    if len(audio_buffer) == 0:
+        return None
+    return np.hstack(list(audio_buffer))
 
 # Bandpass filter
 def butter_bandpass(lowcut, highcut, fs, order=5):
@@ -92,7 +107,10 @@ def trim_audio(data, threshold=TRIM_THRESHOLD):
     return data[start:end]
 
 # Analyze ticks
-def analyze_ticks(peaks, rate):
+def analyze_ticks(peaks, rate, trimmed_audio):
+    if len(peaks) < 2:
+        return None, None, None, None, None, None
+
     # Calculate intervals between ticks
     intervals = np.diff(peaks) / rate  # Convert from samples to seconds
 
@@ -120,81 +138,186 @@ def closest_standard_bph(estimated_bph, common_bph_values=COMMON_BPH_VALUES):
     closest_bph = min(common_bph_values, key=lambda x: abs(x - estimated_bph))
     return closest_bph
 
-# Main script
-if __name__ == "__main__":
-    clear_terminal()
-    list_input_devices()
-    device_index = int(input("Enter the index of the device you want to use: "))
-    clear_terminal()
-
-    audio_data = record_audio(device_index)
-
-    # Normalize audio data
-    audio_data = audio_data / np.max(np.abs(audio_data))
-
-    # Apply bandpass filter
-    filtered_audio = bandpass_filter(audio_data, LOWCUT, HIGHCUT, RATE)
-
-    # Increase gain
-    filtered_audio *= GAIN
-
-    # Trim audio
-    trimmed_audio = trim_audio(filtered_audio)
-
-    # Define threshold for peak detection
-    peak_threshold = INITIAL_PEAK_THRESHOLD
-
-    # Detect peaks in the trimmed audio signal
-    peaks, properties = find_peaks(trimmed_audio, height=peak_threshold, distance=RATE/10)
-
-    # Estimate BPH
-    intervals = np.diff(peaks) / RATE
-    estimated_bph = estimate_bph(intervals)
-    closest_bph = closest_standard_bph(estimated_bph)
-
-    # Ask user if they want to use the estimated BPH or manually enter BPH
-    use_auto_bph = input(f"Estimated BPH is {closest_bph}. Do you want to use this value? (y/n): ").strip().lower()
-
-    if use_auto_bph == 'y':
-        BPH = closest_bph
-    else:
-        BPH = int(input("Enter the BPH value manually: "))
-
-    # Analyze ticks
-    intervals, beat_errors, average_beat_error, tick_frequency, amplitudes, amplitude_variance = analyze_ticks(peaks, RATE)
+# Calculate daily accuracy
+def calculate_daily_accuracy(intervals, bph):
+    if intervals is None or len(intervals) == 0:
+        return None
 
     # Calculate expected interval
-    expected_interval = 1 / (BPH / 3600)  # Convert BPH to beats per second
+    expected_interval = 1 / (bph / 3600)  # Convert BPH to beats per second
 
     # Calculate accuracy
     accuracy = (intervals - expected_interval) * 1000  # Convert to milliseconds
-    daily_accuracy_seconds = ( ( np.sum(accuracy) / len(accuracy) ) / 1000 ) * 24 * 3600
+    daily_accuracy_seconds = (np.mean(accuracy) / 1000) * 24 * 3600
 
-    # Output analysis results
-    print("=======================")
-    print("Average beat error (s):", average_beat_error)
-    print("Tick frequency (Hz):", tick_frequency)
-    print("Amplitude variance:", amplitude_variance)
-    print("Average tick accuracy (ms):", np.mean(accuracy))
-    print("Daily accuracy (s): ",daily_accuracy_seconds)
-    print("=======================")
+    return daily_accuracy_seconds, np.mean(accuracy)
 
-    # Plot the audio signal and detected peaks
-    plt.figure(figsize=(12, 6))
-    plt.plot(trimmed_audio, label='Filtered and Trimmed Audio Signal')
-    plt.plot(peaks, trimmed_audio[peaks], "x", label='Detected Peaks')
-    plt.legend()
-    plt.title("Filtered and Trimmed Audio Signal with Detected Peaks")
-    plt.xlabel("Sample Number")
-    plt.ylabel("Amplitude")
-    plt.show()
+# Live monitoring function with sliding window
+def live_monitor(device_index):
+    global running, accuracy_history, current_bph
 
-    # Plot accuracy
-    plt.figure(figsize=(12, 6))
-    plt.plot(accuracy, label='Accuracy (ms)')
-    plt.hlines(0, 0, len(accuracy), colors='r', linestyles='dashed', label='Expected Interval')
-    plt.legend()
-    plt.title("Watch Accuracy Over Time")
-    plt.xlabel("Tick Number")
-    plt.ylabel("Accuracy (ms)")
-    plt.show()
+    print(f"\nStarting live monitoring with BPH: {current_bph}")
+    print(f"Recording window: {RECORD_WINDOW_SECONDS} seconds")
+    print(f"Update interval: {UPDATE_INTERVAL_SECONDS} second")
+    print("Press Ctrl+C to stop monitoring...")
+    print("=" * 50)
+
+    # Start continuous recording in a separate thread
+    recording_thread = threading.Thread(target=record_audio_continuous, args=(device_index,))
+    recording_thread.daemon = True
+    recording_thread.start()
+
+    # Wait for buffer to fill up initially
+    print("Filling audio buffer...")
+    time.sleep(RECORD_WINDOW_SECONDS)
+
+    last_update_time = time.time()
+
+    while running:
+        current_time = time.time()
+
+        # Update every UPDATE_INTERVAL_SECONDS
+        if current_time - last_update_time >= UPDATE_INTERVAL_SECONDS:
+            try:
+                # Get current audio buffer
+                audio_data = get_current_audio_buffer()
+
+                if audio_data is not None and len(audio_data) > 0:
+                    # Normalize audio data
+                    audio_data = audio_data / np.max(np.abs(audio_data))
+
+                    # Apply bandpass filter
+                    filtered_audio = bandpass_filter(audio_data, LOWCUT, HIGHCUT, RATE)
+
+                    # Increase gain
+                    filtered_audio *= GAIN
+
+                    # Trim audio
+                    trimmed_audio = trim_audio(filtered_audio)
+
+                    # Detect peaks
+                    peaks, properties = find_peaks(trimmed_audio, height=INITIAL_PEAK_THRESHOLD, distance=RATE/10)
+
+                    if len(peaks) >= 2:
+                        # Analyze ticks
+                        result = analyze_ticks(peaks, RATE, trimmed_audio)
+                        if result[0] is not None:
+                            intervals, beat_errors, average_beat_error, tick_frequency, amplitudes, amplitude_variance = result
+
+                            # Calculate accuracy
+                            accuracy_result = calculate_daily_accuracy(intervals, current_bph)
+                            if accuracy_result is not None:
+                                daily_accuracy, avg_accuracy_ms = accuracy_result
+                                accuracy_history.append(daily_accuracy)
+
+                                # Clear screen and display results
+                                clear_terminal()
+                                print(f"Live Watch Accuracy Monitor - BPH: {current_bph}")
+                                print(f"Analysis Window: {RECORD_WINDOW_SECONDS} seconds | Update: {UPDATE_INTERVAL_SECONDS} second")
+                                print("=" * 60)
+                                print(f"Current Daily Accuracy: {daily_accuracy:.2f} seconds")
+                                print(f"Average Tick Accuracy: {avg_accuracy_ms:.2f} ms")
+                                print(f"Average Beat Error: {average_beat_error:.4f} s")
+                                print(f"Tick Frequency: {tick_frequency:.2f} Hz")
+                                print(f"Amplitude Variance: {amplitude_variance:.4f}")
+                                print(f"Ticks Detected: {len(peaks)}")
+                                print(f"Buffer Size: {len(audio_buffer)} chunks")
+
+                                if len(accuracy_history) > 1:
+                                    avg_daily_accuracy = np.mean(accuracy_history)
+                                    print(f"Average Daily Accuracy (last {len(accuracy_history)} readings): {avg_daily_accuracy:.2f} seconds")
+
+                                print("=" * 60)
+                                print("Monitoring... (Press Ctrl+C to stop)")
+                            else:
+                                print("No valid ticks detected in this sample")
+                        else:
+                            print("Insufficient ticks detected for analysis")
+                    else:
+                        print("No peaks detected in this sample")
+
+                else:
+                    print("No audio data available")
+
+            except Exception as e:
+                print(f"Error during monitoring: {e}")
+
+            last_update_time = current_time
+
+        time.sleep(0.1)  # Small delay to prevent excessive CPU usage
+
+# Main script
+if __name__ == "__main__":
+    clear_terminal()
+    print("Watch Accuracy Monitor")
+    print("=" * 30)
+
+    # Ask for BPH at the beginning
+    print("Please enter the BPH (Beats Per Hour) for your watch:")
+    print("Common BPH values:", COMMON_BPH_VALUES)
+
+    while True:
+        try:
+            bph_input = input("Enter BPH value: ").strip()
+            if bph_input.lower() == 'auto':
+                # Auto-detect BPH
+                list_input_devices()
+                device_index = int(input("Enter the index of the device you want to use: "))
+
+                print("Recording sample to estimate BPH...")
+                # Use a simple recording for BPH estimation
+                audio = pyaudio.PyAudio()
+                stream = audio.open(format=FORMAT,
+                                    channels=CHANNELS,
+                                    rate=RATE,
+                                    input=True,
+                                    input_device_index=device_index,
+                                    frames_per_buffer=CHUNK)
+
+                frames = []
+                for _ in range(0, int(RATE / CHUNK * 5)):  # Record 5 seconds for estimation
+                    data = stream.read(CHUNK)
+                    frames.append(np.frombuffer(data, dtype=np.int16))
+
+                stream.stop_stream()
+                stream.close()
+                audio.terminate()
+
+                audio_data = np.hstack(frames)
+                audio_data = audio_data / np.max(np.abs(audio_data))
+                filtered_audio = bandpass_filter(audio_data, LOWCUT, HIGHCUT, RATE)
+                filtered_audio *= GAIN
+                trimmed_audio = trim_audio(filtered_audio)
+                peaks, _ = find_peaks(trimmed_audio, height=INITIAL_PEAK_THRESHOLD, distance=RATE/10)
+
+                if len(peaks) >= 2:
+                    intervals = np.diff(peaks) / RATE
+                    estimated_bph = estimate_bph(intervals)
+                    closest_bph = closest_standard_bph(estimated_bph)
+                    print(f"Estimated BPH: {closest_bph}")
+                    current_bph = closest_bph
+                else:
+                    print("Could not detect ticks for BPH estimation. Please enter manually.")
+                    continue
+            else:
+                current_bph = int(bph_input)
+            break
+        except ValueError:
+            print("Please enter a valid number or 'auto' for automatic detection")
+
+    # List devices and get device index
+    list_input_devices()
+    device_index = int(input("Enter the index of the device you want to use: "))
+
+    # Start live monitoring
+    running = True
+    try:
+        live_monitor(device_index)
+    except KeyboardInterrupt:
+        running = False
+        print("\nMonitoring stopped.")
+        print("Final statistics:")
+        if len(accuracy_history) > 0:
+            print(f"Average daily accuracy: {np.mean(accuracy_history):.2f} seconds")
+            print(f"Min daily accuracy: {np.min(accuracy_history):.2f} seconds")
+            print(f"Max daily accuracy: {np.max(accuracy_history):.2f} seconds")
